@@ -1,0 +1,281 @@
+name: Test Binaries
+
+on:
+  push:
+    branches-ignore:
+      - main
+    tags:
+      - '*'
+  workflow_dispatch:
+    inputs:
+      git-ref:
+        description: Git Hash (Optional)
+        required: false
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash -l {0}
+
+jobs:
+  builtin:
+    name: ${{ matrix.os }}/${{ matrix.TARGET }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-20.04, ubuntu-22.04, macos-13, macos-14, windows-2019, windows-2022]
+
+        include:
+        - os: ubuntu-20.04
+          TARGET: "ubuntu2004-x86_64"
+          SHORTOS: ubuntu
+        - os: ubuntu-22.04
+          TARGET: "ubuntu2204-x86_64"
+          SHORTOS: ubuntu
+        - os: macos-13
+          TARGET: "darwin-x86_64"
+          SHORTOS: osx
+        - os: macos-14
+          TARGET: "darwin-aarch64"
+          SHORTOS: osx
+        - os: windows-2019
+          TARGET: "windows-x86_64"
+          SHORTOS: win
+        - os: windows-2022
+          TARGET: "windows-x86_64"
+          SHORTOS: win
+
+    steps:
+      - name: Checkout IDAES-ext source
+        uses: actions/checkout@v4
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - name: Configure curl
+        run: |
+          CURLRC="$(cat <<EOF
+             retry = 0
+             max-time = 30
+          EOF
+          )"
+          echo "$CURLRC" > ${GITHUB_WORKSPACE}/.curlrc
+          echo "$CURLRC" > ${GITHUB_WORKSPACE}/_curlrc
+          echo "CURL_HOME=$GITHUB_WORKSPACE" >> $GITHUB_ENV
+      - name: Setup IDAES package directories
+        run: |
+          IDAES_DIR="${GITHUB_WORKSPACE}/cache/tpl"
+          mkdir -p "$IDAES_DIR"
+          DOWNLOAD_DIR="${GITHUB_WORKSPACE}/cache/download"
+          mkdir -p "$DOWNLOAD_DIR"
+          echo "IDAES_DIR=$IDAES_DIR" >> $GITHUB_ENV
+          echo "DOWNLOAD_DIR=$DOWNLOAD_DIR" >> $GITHUB_ENV
+      - name: Install Dependencies
+        run: |
+          pip install pyomo pytest scipy "numpy<2" parameterized
+      - name: Download Binaries
+        run: |
+            IDAES_BIN_DIR=$IDAES_DIR/bin
+            echo "$IDAES_BIN_DIR" >> $GITHUB_PATH
+            echo "LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$IDAES_BIN_DIR:$IDAES_BIN_DIR/lib" >> $GITHUB_ENV
+            echo "DYLD_LIBRARY_PATH=$DYLD_LIBRARY_PATH:$IDAES_BIN_DIR:$IDAES_BIN_DIR/lib" >> $GITHUB_ENV
+            IDAES_PC_DIR=$IDAES_BIN_DIR/lib/pkgconfig
+            echo "PKG_CONFIG_PATH=$PKG_CONFIG_PATH:$IDAES_PC_DIR" >> $GITHUB_ENV
+            # CyIpopt on Windows uses a custom environment var rather than pkg-config
+            #if test "${{ matrix.SHORTOS }}" == win; then
+            #    echo "IPOPTWINDIR=$IDAES_BIN_DIR" >> $GITHUB_ENV
+            #fi
+            mkdir -p $IDAES_BIN_DIR
+            IPOPT_TAR=${DOWNLOAD_DIR}/ipopt.tar.gz
+            if test "${{ matrix.os }}" == macos-14; then
+                # Basically a bug in the build process -- we forgot to change the name
+                # to aarch64 here.
+                IDAES_LOCAL_TAR=${IDAES_BIN_DIR}/idaes-local-darwin-arm64.tar.gz
+            else
+                IDAES_LOCAL_TAR=${IDAES_BIN_DIR}/idaes-local-${{ matrix.TARGET }}.tar.gz
+            fi
+            if test ! -e $IPOPT_TAR; then
+                echo "...downloading Ipopt"
+                URL=https://github.com/IDAES/idaes-ext
+                RELEASE=$(curl --max-time 150 --retry 8 \
+                    -L -s -H 'Accept: application/json' ${URL}/releases/latest)
+                VER=$(echo $RELEASE | sed -e 's/.*"tag_name":"\([^"]*\)".*/\1/')
+                URL=${URL}/releases/download/3.4.2/idaes-solvers-${{ matrix.TARGET }}.tar.gz
+                curl --max-time 150 --retry 8 \
+                  -L $URL > $IPOPT_TAR
+            fi
+            echo "Downloaded idaes-solvers .tar.gz file"
+            file $IPOPT_TAR # Hopefully this works on Windows
+            cd $IDAES_BIN_DIR
+            if test "${{ matrix.SHORTOS }}" == osx; then
+                echo "Unpacking $IPOPT_TAR into $PWD"
+                tar -xvf $IPOPT_TAR
+                echo "Unpacking $IDAES_LOCAL_TAR"
+                tar -xvf $IDAES_LOCAL_TAR
+            else
+                echo "Unpacking $IPOPT_TAR into $PWD"
+                tar -xzi < $IPOPT_TAR
+                echo "Unpacking $IDAES_LOCAL_TAR"
+                tar -xzi < $IDAES_LOCAL_TAR
+            fi
+            echo "Done unpacking tar files"
+            echo ""
+            echo "$IDAES_BIN_DIR"
+            ls -l $IDAES_BIN_DIR
+            echo "$IDAES_PC_DIR"
+            ls -l $IDAES_PC_DIR
+            #- name: Check sipopt/k_aug
+            #  run: |
+            #    $IDAES_DIR/bin/ipopt --version
+            #    $IDAES_DIR/bin/ipopt_sens --version
+            #    $IDAES_DIR/bin/k_aug --version
+      - name: Configure and Install cyipopt
+        run: |
+          IDAES_PC_DIR=$IDAES_BIN_DIR/lib/pkgconfig
+          echo "PKG_CONFIG_PATH=$PKG_CONFIG_PATH:$IDAES_PC_DIR" >> $GITHUB_ENV
+          echo "$PKG_CONFIG_PATH"
+          #pkg-config --libs --cflags ipopt
+          #pip install git+https://github.com/mechmotum/cyipopt.git
+          ls $IDAES_DIR/bin
+          ls $IDAES_DIR/bin/lib
+          pip install cyipopt
+      - name: Run tests
+        run: |
+          pytest -v -rs `pwd`/test
+
+  docker:
+    name: ${{ matrix.container }}/${{ matrix.TARGET }}
+    runs-on: ubuntu-latest
+    container:
+      image: ${{ matrix.container }}
+    strategy:
+      fail-fast: false
+      matrix:
+        container: ["rockylinux:8", "rockylinux:9", "debian:10", "debian:11", "debian:12"]
+        include:
+          - container: "rockylinux:8"
+            TARGET: "el8"
+            SHORTOS: el
+          - container: "rockylinux:9"
+            TARGET: "ubuntu2204"
+            SHORTOS: el
+          - container: "debian:10"
+            TARGET: "el8"
+            SHORTOS: deb
+          - container: "debian:11"
+            TARGET: "ubuntu2004"
+            SHORTOS: deb
+          - container: "debian:12"
+            TARGET: "ubuntu2204"
+            SHORTOS: deb
+    steps:
+    - name: Check out source
+      uses: actions/checkout@v4
+    - name: Install basic libraries
+      run: |
+        cat /etc/*-release
+        if test "${{ matrix.SHORTOS }}" == el; then
+          yum -y update
+          yum -y install libgfortran blas libgomp lapack
+          yum -y install pkg-config gcc git cmake
+          yum -y install g++ # This doesn't work on rhel8/rocky8?
+          yum -y install wget curl || yum -y install --allowerasing wget curl
+        else
+          apt-get update
+          apt-get -y install libgfortran5 libgomp1 liblapack3 libblas3 libc6
+          apt-get -y install wget curl pkg-config gcc g++ git cmake
+        fi
+        if [ `uname -m` = "aarch64" ]; then 
+          wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-aarch64.sh -O $WORKSPACE/miniconda.sh
+          DISTRO='aarch64'
+        fi
+        if [ `uname -m` = "x86_64" ]; then
+          wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O $WORKSPACE/miniconda.sh
+          DISTRO='x86_64'
+        fi
+        echo "DISTRO=$DISTRO" >> $GITHUB_ENV
+        chmod +x $WORKSPACE/miniconda.sh
+        bash $WORKSPACE/miniconda.sh -b -p $WORKSPACE/miniconda
+        ls $WORKSPACE/miniconda/bin
+    - name: Setup IDAES package directories
+      run: |
+        IDAES_DIR="${GITHUB_WORKSPACE}/cache/tpl"
+        mkdir -p "$IDAES_DIR"
+        DOWNLOAD_DIR="${GITHUB_WORKSPACE}/cache/download"
+        mkdir -p "$DOWNLOAD_DIR"
+        # Add a global var / something that you want to exist in future steps
+        echo "IDAES_DIR=$IDAES_DIR" >> $GITHUB_ENV
+        echo "DOWNLOAD_DIR=$DOWNLOAD_DIR" >> $GITHUB_ENV
+    - name: Install Dependencies
+      run: |
+        eval "$(/miniconda/bin/conda shell.bash hook)"
+        conda --version
+        conda create -n idaes python=3.10 pip psutil
+        conda activate idaes
+        # Grab the most recent release of the IDAES extensions
+        pip install pyomo pytest scipy "numpy<2" parameterized
+    - name: Download Binaries
+      run: |
+          IDAES_BIN_DIR=$IDAES_DIR/bin
+          # Add something to the path; good for executables
+          echo "$IDAES_BIN_DIR" >> $GITHUB_PATH
+          echo "LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$IDAES_BIN_DIR/lib" >> $GITHUB_ENV
+          echo "DYLD_LIBRARY_PATH=$DYLD_LIBRARY_PATH:$IDAES_BIN_DIR/lib" >> $GITHUB_ENV
+          IDAES_PC_DIR=$IDAES_BIN_DIR/lib/pkgconfig
+          echo "PKG_CONFIG_PATH=$PKG_CONFIG_PATH:$IDAES_PC_DIR" >> $GITHUB_ENV
+          mkdir -p $IDAES_BIN_DIR
+          IPOPT_TAR=${DOWNLOAD_DIR}/ipopt.tar.gz
+          if test ! -e $IPOPT_TAR; then
+              echo "...downloading Ipopt"
+              URL=https://github.com/IDAES/idaes-ext
+              RELEASE=$(curl --max-time 150 --retry 8 \
+                  -L -s -H 'Accept: application/json' ${URL}/releases/latest)
+              VER=$(echo $RELEASE | sed -e 's/.*"tag_name":"\([^"]*\)".*/\1/')
+              URL=${URL}/releases/download/3.4.2/idaes-solvers-${{ matrix.TARGET }}-$DISTRO.tar.gz
+              curl --max-time 150 --retry 8 \
+                -L $URL > $IPOPT_TAR
+          fi
+          cd $IDAES_BIN_DIR
+          IDAES_LOCAL_TAR=${IDAES_BIN_DIR}/idaes-local-${{ matrix.TARGET }}-$DISTRO.tar.gz
+          echo "Unpacking $IPOPT_TAR into $PWD"
+          tar -xzi < $IPOPT_TAR
+          echo "Unpacking $IDAES_LOCAL_TAR"
+          tar -xzi < $IDAES_LOCAL_TAR
+          echo ""
+          echo "$IDAES_BIN_DIR"
+          ls -l $IDAES_BIN_DIR
+          #- name: Check sipopt/k_aug
+          #  run: |
+          #    $IDAES_DIR/bin/ipopt --version
+          #    $IDAES_DIR/bin/ipopt_sens --version
+          #    $IDAES_DIR/bin/k_aug --version
+    - name: Configure and Install cyipopt
+      run: |
+        echo "$PKG_CONFIG_PATH"
+        echo "$IDAES_DIR/bin/lib/pkgconfig"
+        ls "$IDAES_DIR"
+        ls "$IDAES_DIR/bin"
+        ls "$IDAES_DIR/bin/lib"
+        ls "$IDAES_DIR/bin/lib/pkgconfig"
+        pkg-config --libs --cflags ipopt
+        eval "$(/miniconda/bin/conda shell.bash hook)"
+        conda activate idaes
+        # Building extensions here shouldn't be necessary, as we distribute
+        # libpynumero_ASL, but our Rocky8 tests only pass if we build from
+        # scratch here...
+        pyomo build-extensions
+        pip install cyipopt
+        #pip install git+https://github.com/mechmotum/cyipopt.git
+    - name: Run tests
+      run: |
+        eval "$(/miniconda/bin/conda shell.bash hook)"
+        conda activate idaes
+        pip list
+        echo "$LD_LIBRARY_PATH"
+        ls "$IDAES_DIR/bin/lib"
+        python -c "import cyipopt" # Does this fail with library not found?
+        pytest -v -rs `pwd`/test
